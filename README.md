@@ -2,9 +2,9 @@
 DB2 Driver for Metabase v0.39.0.1, works with Db2 LUW V11.5.
 
 Thanks to everyone.
-@dludwig-jrt https://github.com/damienchambe/metabase-db2-driver
-@cabo40 https://github.com/cabo40/metabase-db2-driver  
-@damienchambe https://github.com/damienchambe/metabase-db2-driver
++ @dludwig-jrt https://github.com/damienchambe/metabase-db2-driver
++ @cabo40 https://github.com/cabo40/metabase-db2-driver  
++ @damienchambe https://github.com/damienchambe/metabase-db2-driver
 
 ## Building the driver
 ### Prereqs: Install Metabase locally, compiled for building drivers
