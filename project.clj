@@ -1,11 +1,10 @@
-(defproject metabase/db2-driver "1.0.0"
+(defproject metabase/db2-driver "1.0.0-v0.39.0.1"
   :min-lein-version "2.5.0"
 
   :profiles
   {:provided
    {:dependencies [
      [metabase-core "1.0.0-SNAPSHOT"]
-     [com.jrt/jt400 "1.0"]
    ]}
 
    :uberjar

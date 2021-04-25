@@ -1,12 +1,12 @@
 # Complete list of options here: https://github.com/metabase/metabase/wiki/Metabase-Plugin-Manifest-Reference
 info:
-  name: Metabase AS400 DB2 Driver
-  version: 1.0.0
-  description: Allows Metabase to connect to AS400 DB2 databases.
+  name: Metabase DB2 Driver
+  version: 1.0.0-v0.39.0.1
+  description: Allows Metabase to connect to DB2 databases.
 dependencies:
-  - class: com.ibm.as400.access.AS400JDBCDriver
+  - class: com.ibm.db2.jcc.DB2Driver
     message: >
-      Metabase requires the AS400 DB2 JDBC driver in order to connect to AS400 DB2 databases, but we can't ship it as part
+      Metabase requires the DB2 JDBC Type 4 driver in order to connect to DB2 databases, but we can't ship it as part
       of Metabase due to licensing restrictions.
 driver:
   name: db2
@@ -17,17 +17,17 @@ driver:
     - host
     - merge:
         - port
-        - default: 3386
-    - merge:
-        - dbname
-        - name: db
-          display-name: Database name
-          placeholder: SCHEMA NAME
+        - default: 50000
+    - dbname
     - user
     - password
+    - ssl
+    - merge:
+        - additional-options
+        - placeholder: "defaultIsolationLevel=1;readOnly=true;retrieveMessagesFromServerOnGetMessage=true;"
   connection-properties-include-tunnel-config: true
 init:
   - step: load-namespace
     namespace: metabase.driver.db2
   - step: register-jdbc-driver
-    class: com.ibm.as400.access.AS400JDBCDriver
+    class: com.ibm.db2.jcc.DB2Driver

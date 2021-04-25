@@ -2,22 +2,29 @@
   (:require [clojure.java.jdbc :as jdbc]
             [clojure.string :as str]
             [honeysql.core :as hsql]
+            [java-time :as t]
             [metabase.driver :as driver]
             [metabase.driver.common :as driver.common]
             [metabase.driver.sql
              [query-processor :as sql.qp]
              [util :as sql.u]]
+            [metabase.driver.sql :as sql]
             [metabase.driver.sql-jdbc
+             [common :as sql-jdbc.common]
              [connection :as sql-jdbc.conn]
              [execute :as sql-jdbc.execute]
              [sync :as sql-jdbc.sync]]
             [metabase.driver.sql.util.unprepare :as unprepare]
+            [metabase.driver.sql.parameters.substitution :as params.substitution]
             [metabase.util
-             [date :as du]
+             [date-2 :as du]
              [honeysql-extensions :as hx]
-             [ssh :as ssh]])
-  (:import [java.sql ResultSet Types]
-           java.util.Date))
+             [ssh :as ssh]]
+            [schema.core :as s])
+  (:import [java.sql ResultSet Time Timestamp Types]
+           [java.util Calendar Date TimeZone]
+           [java.time Instant LocalDateTime OffsetDateTime OffsetTime ZonedDateTime LocalDate LocalTime]
+           java.time.temporal.Temporal))
 
 (driver/register! :db2, :parent :sql-jdbc)
 
@@ -51,6 +58,17 @@
 
     #".*" ; default
     message))
+
+;; Additional options: https://www.ibm.com/support/knowledgecenter/en/SSEPGG_9.7.0/com.ibm.db2.luw.apdv.java.doc/src/tpc/imjcc_r0052038.html
+(defmethod driver/connection-properties :db2 [_]
+  (ssh/with-tunnel-config
+    [driver.common/default-host-details
+     driver.common/default-port-details
+     driver.common/default-dbname-details
+     driver.common/default-user-details
+     driver.common/default-password-details
+     driver.common/default-ssl-details
+     driver.common/default-additional-options-details]))
 
 (defmethod driver.common/current-db-time-date-formatters :db2 [_]     ;; "2019-09-14T18:03:20.679658000-00:00"
 ;;  (println "current-db-time-date-formatters")
@@ -108,40 +126,134 @@
 
 (defmethod sql.qp/date [:db2 :day-of-week] [driver _ expr] (hsql/call :dayofweek expr))
 
-(defmethod driver/date-add :db2 [_ dt amount unit]
-  (hx/+ (hx/->timestamp dt) (case unit
-                              :second  (hsql/raw (format "current timestamp + %d seconds" (int amount)))
-                              :minute  (hsql/raw (format "current timestamp + %d minutes" (int amount)))
-                              :hour    (hsql/raw (format "current timestamp + %d hours" (int amount)))
-                              :day     (hsql/raw (format "current timestamp + %d days" (int amount)))
-                              :week    (hsql/raw (format "current timestamp + %d days" (int (hx/* amount (hsql/raw 7)))))
-                              :month   (hsql/raw (format "current timestamp + %d months" (int amount)))
-                              :quarter (hsql/raw (format "current timestamp + %d months" (int (hx/* amount (hsql/raw 3)))))
-                              :year    (hsql/raw (format "current timestamp + %d years" (int amount))))))
 
-(defmethod sql.qp/unix-timestamp->timestamp [:db2 :seconds] [_ _ expr]
+(defmethod sql.qp/add-interval-honeysql-form :db2 [_ hsql-form amount unit]
+  (hx/+ (hx/->timestamp hsql-form) (case unit
+    :second  (hsql/raw (format "%d seconds" (int amount)))
+    :minute  (hsql/raw (format "%d minutes" (int amount)))
+    :hour    (hsql/raw (format "%d hours" (int amount)))
+    :day     (hsql/raw (format "%d days" (int amount)))
+    :week    (hsql/raw (format "%d days" (int (hx/* amount (hsql/raw 7)))))
+    :month   (hsql/raw (format "%d months" (int amount)))
+    :quarter (hsql/raw (format "%d months" (int (hx/* amount (hsql/raw 3)))))
+    :year    (hsql/raw (format "%d years" (int amount)))
+  )))
+
+(defmethod sql.qp/unix-timestamp->honeysql [:db2 :seconds] [_ _ expr]
   (hx/+ (hsql/raw "timestamp('1970-01-01 00:00:00')") (hsql/raw (format "%d seconds" (int expr))))
 
-(defmethod sql.qp/unix-timestamp->timestamp [:db2 :milliseconds] [driver _ expr]
+(defmethod sql.qp/unix-timestamp->honeysql [:db2 :milliseconds] [driver _ expr]
   (hx/+ (hsql/raw "timestamp('1970-01-01 00:00:00')") (hsql/raw (format "%d seconds" (int (hx// expr 1000)))))))
 
 (def ^:private now (hsql/raw "current timestamp"))
 
-(defmethod sql.qp/current-datetime-fn :db2 [_] now)
+(defmethod sql.qp/current-datetime-honeysql-form :db2 [_] now)
 
+;; Use LIMIT OFFSET support DB2 v9.7 https://www.ibm.com/developerworks/community/blogs/SQLTips4DB2LUW/entry/limit_offset?lang=en
+;; Maybe it could not to be necessary with the use of DB2_COMPATIBILITY_VECTOR
+(defmethod sql.qp/apply-top-level-clause [:db2 :limit]
+  [_ _ honeysql-query {value :limit}]
+  (merge honeysql-query
+         (hsql/raw (format "FETCH FIRST %d ROWS ONLY" value))))
+
+(defmethod sql.qp/apply-top-level-clause [:db2 :page]
+  [driver _ honeysql-query {{:keys [items page]} :page}]
+  (let [offset (* (dec page) items)]
+    (if (zero? offset)
+      ;; if there's no offset we can use the single-nesting implementation for `apply-limit`
+      (sql.qp/apply-top-level-clause driver :limit honeysql-query {:limit items})
+      ;; if we need to do an offset we have to do double-nesting
+      {:select [:*]
+       :from   [{:select [:tmp.* [(hsql/raw "ROW_NUMBER() OVER()") :rn]]
+                 :from   [[(merge {:select [:*]}
+                                  honeysql-query)
+                           :tmp]]}]
+       :where  [(hsql/raw (format "rn BETWEEN %d AND %d" offset (+ offset items)))]})))
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                           metabase.driver.sql date workarounds                                 |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+;; Filtering with dates causes a -245 error. ;;v0.33.x
+;; Explicit cast to timestamp when Date function is called to prevent db2 unknown parameter type.
+;; Maybe it could not to be necessary with the use of DB2_DEFERRED_PREPARE_SEMANTICS
+(defmethod sql.qp/->honeysql [:db2 Date]
+  [_ date]
+  		(hx/->timestamp (t/format "yyyy-MM-dd HH:mm:ss" date))) ;;v0.34.x needs it?
+  ;;(hx/->timestamp (du/format-date "yyyy-MM-dd HH:mm:ss" date))) ;;v0.33.x
+
+(defmethod sql.qp/->honeysql [:db2 Timestamp]
+  [_ date]
+  		(hx/->timestamp (t/format "yyyy-MM-dd HH:mm:ss" date)))
+
+;; MEGA HACK from sqlite.clj ;;v0.34.x
+;; Fix to Unrecognized JDBC type: 2014. ERRORCODE=-4228
+(defn- zero-time? [t]
+  (= (t/local-time t) (t/local-time 0)))
+
+(defmethod sql.qp/->honeysql [:db2 LocalDate]
+  [_ t]
+  (hsql/call :date (hx/literal (du/format-sql t))))
+
+(defmethod sql.qp/->honeysql [:db2 LocalDateTime]
+  [driver t]
+  (if (zero-time? t)
+    (sql.qp/->honeysql driver (t/local-date t))
+    (hsql/call :datetime (hx/literal (du/format-sql t)))))
+
+(defmethod sql.qp/->honeysql [:db2 LocalTime]
+  [_ t]
+  (hsql/call :time (hx/literal (du/format-sql t))))
+
+(defmethod sql.qp/->honeysql [:db2 OffsetDateTime]
+  [driver t]
+  (if (zero-time? t)
+    (sql.qp/->honeysql driver (t/local-date t))
+    (hsql/call :datetime (hx/literal (du/format-sql t)))))
+
+(defmethod sql.qp/->honeysql [:db2 OffsetTime]
+  [_ t]
+  (hsql/call :time (hx/literal (du/format-sql t))))
+
+(defmethod sql.qp/->honeysql [:db2 ZonedDateTime]
+  [driver t]
+  (if (zero-time? t)
+    (sql.qp/->honeysql driver (t/local-date t))
+    (hsql/call :datetime (hx/literal (du/format-sql t)))))
+
+;; (.getObject rs i LocalDate) doesn't seem to work, nor does `(.getDate)`; ;;v0.34.x
+;; Merged from vertica.clj e sqlite.clj.
+;; Fix to Invalid data conversion: Wrong result column type for requested conversion. ERRORCODE=-4461
+(defmethod sql-jdbc.execute/read-column [:db2 Types/DATE]
+		[_ _ ^ResultSet rs _ ^Integer i]
+		  (let [s (.getString rs i)
+		        t (du/parse s)]
+		    t))
+
+(defmethod sql-jdbc.execute/read-column [:db2 Types/TIME]
+		[_ _ ^ResultSet rs _ ^Integer i]
+		  (let [s (.getString rs i)
+		        t (du/parse s)]
+		    t))
+
+(defmethod sql-jdbc.execute/read-column [:db2 Types/TIMESTAMP]
+		[_ _ ^ResultSet rs _ ^Integer i]
+		  (let [s (.getString rs i)
+		        t (du/parse s)]
+		    t))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                         metabase.driver.sql-jdbc impls                                         |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-(defmethod sql-jdbc.conn/connection-details->spec :db2
-  [_ {:keys [host port dbname]
-      :or   {host "localhost", port 3386, dbname ""}
-      :as   details}]
-  (merge {:classname "com.ibm.as400.access.AS400JDBCDriver"   ;; must be in classpath
-          :subprotocol "as400"
-          :subname (str "//" host ":" port "/" dbname)}                    ;; :subname (str "//" host "/" dbname)}   (str "//" host ":" port "/" (or dbname db))}
-         (dissoc details :host :port :dbname)))
+(defmethod sql-jdbc.conn/connection-details->spec :db2 [_ {:keys [host port db dbname]
+                                                           :or   {host "localhost", port 50000, dbname ""}
+                                                           :as   details}]
+  (-> (merge {:classname   "com.ibm.db2.jcc.DB2Driver"
+              :subprotocol "db2"
+              :subname     (str "//" host ":" port "/" dbname ":" )}
+             (dissoc details :host :port :dbname :ssl))
+      (sql-jdbc.common/handle-additional-options details, :seperator-style :semicolon)))
 
 (defmethod driver/can-connect? :db2 [driver details]
   (let [connection (sql-jdbc.conn/connection-details->spec driver (ssh/include-ssh-tunnel details))]
@@ -169,6 +281,7 @@
     :SMALLINT     :type/Integer
     :TIME         :type/Time
     :TIMESTAMP    :type/DateTime
+    :VARBINARY    :type/*
     :VARCHAR      :type/Text
     :VARGRAPHIC   :type/Text
     :XML          :type/Text
@@ -179,26 +292,25 @@
     (keyword "VARCHAR() FOR BIT DATA")    :type/*} database-type))
 
 (defmethod sql-jdbc.sync/excluded-schemas :db2 [_]
-  #{"SQLJ" 
-    "SYSCAT" 
-    "SYSFUN" 
-    "SYSIBMADM" 
-    "SYSIBMINTERNAL" 
-    "SYSIBMTS" 
-    "SPOOLMAIL"
-    "SYSPROC" 
-    "SYSPUBLIC" 
+  #{"SQLJ"
+    "SYSCAT"
+    "SYSFUN"
+    "SYSIBM"
+    "SYSIBMADM"
+    "SYSIBMINTERNAL"
+    "SYSIBMTS"
+    "SYSPROC"
+    "SYSPUBLIC"
     "SYSSTAT"
     "SYSTOOLS"})
 
-(defmethod sql-jdbc.execute/set-timezone-sql :db2 [_]
-  "SET SESSION TIME ZONE = %s")
+;;(defmethod sql-jdbc.execute/set-timezone-sql :db2 [_]
+;;  "SET SESSION TIME ZONE = %s")
 
-;; instead of returning a CLOB object, return the String. (#9026)
-;; (defmethod sql-jdbc.execute/read-column [:db2 Types/CLOB] [_ _, ^ResultSet resultset, _, ^Integer i]
-;;   (println "XXXXX read-column: " i)
-;;   (.getString resultset i))
+(defmethod sql-jdbc.sync/have-select-privilege? :db2 [driver conn table-schema table-name]
+  true)
 
-;; (defmethod unprepare/unprepare-value [:db2 Date] [_ value]
-;;   (println "XXXXX unprepare/unprepare-value: " value)
-;;   (format "timestamp '%s'" (du/format-date "yyyy-MM-dd hh:mm:ss.SSS ZZ" value)))
+;; Avoid ERRORCODE=-4461, SQLSTATE=42815 error in SQL query when using Date type parameter.
+(s/defmethod sql/->prepared-substitution [:db2 Temporal] :- sql/PreparedStatementSubstitution
+  [_ date]
+  (params.substitution/make-stmt-subs "?" [(t/format "yyyy-MM-dd" date)]))
