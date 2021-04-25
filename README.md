@@ -30,14 +30,6 @@ cp target/uberjar/db2.metabase-driver.jar /path/to/metabase/plugins/
 jar -jar /path/to/metabase/metabase.jar
 ```
 
-*or:*
-
-```bash
-cp target/uberjar/db2.metabase-driver.jar /path/to/metabase/source/plugins
-cd /path/to/metabase/source
-lein run
-```
-
 ## Configurations
 
 You can run as follows to avoid the CharConversionException exceptions. By this way, JCC converts invalid characters to NULL instead of throwing exceptions.
